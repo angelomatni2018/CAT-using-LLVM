@@ -18,6 +18,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <queue>
 
 using namespace std;
 using namespace llvm;
@@ -36,7 +37,10 @@ namespace {
     vector<CallInst*> get_instrs;
 
     AAResults* aa;
-    map<Instruction*, set<Instruction*>> aliases;
+    map<Instruction*, set<Instruction*>> mayAliases;
+    map<Instruction*, set<Instruction*>> mustAliases;
+    map<Value*, set<StoreInst*>> pntStores;
+    SparseBitVector<> escapedInstrs;
   };
 
   struct CAT : public FunctionPass {
@@ -45,6 +49,9 @@ namespace {
     Function* get_fn;
     Function* add_fn;
     Function* sub_fn;
+
+    DFAInfo* dfa;
+    InstrInfo* iInfo;
 
     CAT() : FunctionPass(ID) {}
 
@@ -59,123 +66,290 @@ namespace {
       return false;
     }
 
-    // This function is invoked once per module compiled
-    virtual bool runOnFunction (Function &F) {
-      DFAInfo dfaInfo;
-      InstrInfo instrInfo;
-      instrInfo.F = &F;
-      dfaInfo.aa = &(getAnalysis<AAResultsWrapperPass>().getAAResults());
-
-      collectInstrInfo(instrInfo);
-      
-      computeGenKill(instrInfo, dfaInfo);
-
-      computeInOut(instrInfo, dfaInfo);
-
-      //printDFA(instrInfo, dfaInfo);
-
-      return doConstantPropogation(instrInfo, dfaInfo);
+    bool isCATUpdate(Function* F) {
+      return F == add_fn || F == sub_fn;
     }
 
-    void collectInstrInfo(InstrInfo &iInfo) {
+    bool isCAT(Function* F) {
+      return isCATUpdate(F) || F == get_fn || F == create_fn;
+    }
+
+    // This function is invoked once per module compiled
+    virtual bool runOnFunction (Function &F) {
+      dfa = new DFAInfo();
+      iInfo = new InstrInfo();
+
+      iInfo->F = &F;
+      dfa->aa = &(getAnalysis<AAResultsWrapperPass>().getAAResults());
+
+      collectInstrInfo();
+      
+      markAliases();
+
+      markEscapes();
+      
+      computeGenKill();
+
+      computeInOut();
+
+      //errs() << "\n\nSTART DFA PRINT\n\n";
+      //printDFA();
+
+      bool changed = doConstantPropogation();
+
+      free(dfa);
+      free(iInfo);
+
+      return changed;
+    }
+
+    void collectInstrInfo() {
       unsigned counter = 0;
 
-      for (auto &B : *(iInfo.F)) {
+      for (auto &B : *(iInfo->F)) {
         TerminatorInst *terminatorInst = B.getTerminator();
         unsigned numSucc = terminatorInst->getNumSuccessors();
         for (auto i = 0; i < numSucc; ++i){
           BasicBlock *succ = terminatorInst->getSuccessor(i);
           Instruction *succI = &(succ->front());
-          if (iInfo.iPred.find(succI) == iInfo.iPred.end())
-            iInfo.iPred[succI] = set<Instruction*>();
-          iInfo.iPred[succI].insert(terminatorInst);
+          if (iInfo->iPred.find(succI) == iInfo->iPred.end())
+            iInfo->iPred[succI] = set<Instruction*>();
+          iInfo->iPred[succI].insert(terminatorInst);
         }
 
         for (auto &I : B) {
-          iInfo.instructions.push_back(&I);
-          iInfo.instrIndices[&I] = counter;
+          iInfo->instructions.push_back(&I);
+          iInfo->instrIndices[&I] = counter;
           ++counter;
         }
       }
     }
 
-    // My hacky fix for ignoring Arguments when killing
-    void markKill(InstrInfo &iInfo, DFAInfo &dfa, Instruction* I, Instruction* def) {
-      if (iInfo.instrIndices.find(def) != iInfo.instrIndices.end())
-        dfa.kill[I].set(iInfo.instrIndices[def]);
+    void markAlias(map<Instruction*, set<Instruction*>> &aliases,
+        Instruction* alias1, Instruction* alias2) {
+      if (aliases.find(alias1) == aliases.end())
+        aliases[alias1] = set<Instruction*>();
+      aliases[alias1].insert(alias2);
+      if (aliases.find(alias2) == aliases.end())
+        aliases[alias2] = set<Instruction*>();
+      aliases[alias2].insert(alias1);
     }
 
-    void setKillFromUses(InstrInfo &iInfo, DFAInfo &dfa, Instruction* I, Instruction* def) {
+    // Populates mayAlias and mustAlias maps for DFA
+    void markAliases() {
+      auto stores = set<StoreInst*>();
+      for (auto I : iInfo->instructions) {
+        if (auto* store = dyn_cast<StoreInst>(I)) {
+          stores.insert(store);
+        } else if (auto* load = dyn_cast<LoadInst>(I)) {
+          for (auto store : stores) {
+            bool may = false, must = false;
+
+            switch (dfa->aa->alias(MemoryLocation::get(load), MemoryLocation::get(store))) {
+              case NoAlias:
+                break;
+              case MayAlias:
+                may = true;
+                break;
+              case PartialAlias:
+                may = true;
+                break;
+              case MustAlias:
+                must = true;
+                break;
+              default:
+                abort();
+            }
+            if (may || must) {
+              Instruction* cat = (Instruction*)(store->getValueOperand());
+              Instruction* catLoad = (Instruction*)load;
+              if (may) {
+                markAlias(dfa->mayAliases, catLoad, cat);
+              } else {
+                markAlias(dfa->mustAliases, catLoad, cat);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    bool modRefd(ModRefInfo info) {
+      switch(info) {
+        case MRI_NoModRef:
+          break;
+        case MRI_Ref:
+          return true;
+        case MRI_Mod:
+          return true;
+        case MRI_ModRef:
+          return true;
+        default:
+          abort();
+      }
+      return false;
+    }
+
+    void searchAndEscape(Value* opV) {
+      queue<Value*> vals;
+      Value* aliasedV;
+      vals.push(opV);
+      while (!vals.empty()) {
+        opV = vals.front();
+        vals.pop();
+
+        for (auto store : dfa->pntStores[opV]) {
+          aliasedV = store->getValueOperand();
+          if (auto* aliasedCall = dyn_cast<CallInst>(aliasedV)) {
+            if (aliasedCall->getCalledFunction() == create_fn) {
+              dfa->escapedInstrs.set(iInfo->instrIndices[(Instruction*)aliasedV]);
+            }
+          } else if (isa<PHINode>(aliasedV)) {
+            dfa->escapedInstrs.set(iInfo->instrIndices[(Instruction*)aliasedV]);
+          } else if (dfa->pntStores.find(aliasedV) != dfa->pntStores.end()) {
+            vals.push(aliasedV);
+          }
+        }
+      }
+    }
+
+    // Conservatively escapes CAT creates and phiNodes if Ref, Mod, or ModRef
+    void markEscapes() {
+      for (auto I : iInfo->instructions) {
+        if (auto* store = dyn_cast<StoreInst>(I)) {
+          Value* pntStore = store->getPointerOperand();
+
+          if (dfa->pntStores.find(pntStore) == dfa->pntStores.end())
+            dfa->pntStores[pntStore] = set<StoreInst*>();
+          dfa->pntStores[pntStore].insert(store);
+        } else if (auto* call = dyn_cast<CallInst>(I)) {
+          Function *callee = call->getCalledFunction();  
+          if (isCAT(callee))
+            continue;
+
+          for (int op = 0; op < I->getNumOperands(); ++op) {
+            Value* opV = I->getOperand(op);
+
+            if (auto* opCall = dyn_cast<CallInst>(opV)) {
+              if (opCall->getCalledFunction() == create_fn) {
+                if (modRefd(dfa->aa->getModRefInfo(call, opCall))) {
+                  dfa->escapedInstrs.set(iInfo->instrIndices[(Instruction*)opV]);
+                }
+              }
+            } else if (isa<PHINode>(opV)) {
+              dfa->escapedInstrs.set(iInfo->instrIndices[(Instruction*)opV]);
+            }
+
+            if (dfa->pntStores.find(opV) == dfa->pntStores.end())
+              continue;
+
+            for (auto store : dfa->pntStores[opV]) {
+              if (modRefd(dfa->aa->getModRefInfo(call, MemoryLocation::get(store)))) {
+                // Search to escape CAT creates and phiNodes
+                searchAndEscape(opV);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    void markKill(Instruction* I, Instruction* def) {
+      if (iInfo->instrIndices.find(def) != iInfo->instrIndices.end())
+        dfa->kill[I].set(iInfo->instrIndices[def]);
+    }
+
+    void setKillFromUses(Instruction* I, Instruction* def) {
         for (auto& U : def->uses()) {
           Instruction* user = (Instruction*)(U.getUser());
           if (auto* userCall = dyn_cast<CallInst>(user)) {
             Function* CAT_fn = userCall->getCalledFunction();
-            if ((CAT_fn == add_fn || CAT_fn == sub_fn) && U.getOperandNo() == 0 && user != I) {
-              markKill(iInfo, dfa, I, user);
+            if (isCATUpdate(CAT_fn) && U.getOperandNo() == 0 && user != I) {
+              markKill(I, user);
             }
           } else if (isa<PHINode>(user)) {
-            markKill(iInfo, dfa, I, user);
+            markKill(I, user);
           }
         }
     }
 
-    void computeGenKill(InstrInfo &iInfo, DFAInfo &dfa) {
+    void setKillFromAliases(Instruction* I, Instruction* aliaser) {
+      if (dfa->mustAliases.find(aliaser) != dfa->mustAliases.end()) {
+        for (auto aliasI : dfa->mustAliases[aliaser]) {
+          markKill(I, aliasI);
+          setKillFromUses(I, aliasI);
+        }
+      }
+    }
+
+    void computeGenKill() {
       unsigned counter = 0;
       // GEN, KILL, and instructions
-      for (auto &B : *(iInfo.F)) {
+      for (auto &B : *(iInfo->F)) {
         for (auto &I : B) {
           if (auto* call = dyn_cast<CallInst>(&I)) {
             Function *callee = call->getCalledFunction();  
             if (create_fn == callee) {
-              dfa.gen[&I].set(counter);
+              dfa->gen[&I].set(counter);
               
-              setKillFromUses(iInfo, dfa, &I, &I);
-            } else if (add_fn == callee || sub_fn == callee) {
-              dfa.gen[&I].set(counter);
+              setKillFromUses(&I, &I);
+              setKillFromAliases(&I, &I);
+            } else if (isCATUpdate(callee)) {
+              dfa->gen[&I].set(counter);
 
-              Instruction *original_def = (Instruction*)(call->getArgOperand(0));
-              markKill(iInfo, dfa, &I, original_def);
-
-              setKillFromUses(iInfo, dfa, &I, (Instruction*)(call->getArgOperand(0)));
+              Instruction *def = (Instruction*)(call->getArgOperand(0));
+              if (auto* create_def = dyn_cast<CallInst>(def)) {
+                if (create_def->getCalledFunction() == create_fn) {
+                  markKill(&I, def);
+                  setKillFromUses(&I, def);
+                  setKillFromAliases(&I, def);
+                } else {
+                  // Function returning CATData not meaningful due to conservativeness
+                }
+              } else if (auto* load_def = dyn_cast<LoadInst>(def)) {
+                setKillFromUses(&I, def);
+                setKillFromAliases(&I, def);
+              }
             } else if (get_fn == callee) {
-              dfa.get_instrs.push_back(call);
+              dfa->get_instrs.push_back(call);
             }
           } else if (isa<PHINode>(&I)) {
-            dfa.gen[&I].set(counter);
+            dfa->gen[&I].set(counter);
 
-            setKillFromUses(iInfo, dfa, &I, &I);
+            setKillFromUses(&I, &I);
+            setKillFromAliases(&I, &I);
           }
           ++counter;
         }
       }
     }
 
-    void computeInOut(InstrInfo &iInfo, DFAInfo &dfa) {
+    void computeInOut() {
       // loop until convergence
       bool modified = true;
       while (modified) {
         modified = false;
 
         // Loop forwards through instructions
-        for (auto bbIter = iInfo.F->getBasicBlockList().begin(); bbIter != iInfo.F->getBasicBlockList().end(); ++bbIter) {
+        for (auto bbIter = iInfo->F->getBasicBlockList().begin(); bbIter != iInfo->F->getBasicBlockList().end(); ++bbIter) {
           Instruction *pred = NULL;
           for (auto iIter = bbIter->begin(); iIter != bbIter->end(); ++iIter) {
             Instruction &I = *iIter;
 
             // IN = union of predecessor OUT
-            if (iInfo.iPred.count(&I)) { // Front with many possible predecessors
-              for (auto &elem : iInfo.iPred[&I]) {
-                modified |= (dfa.in[&I] |= dfa.out[elem]);
+            if (iInfo->iPred.count(&I)) { // Front with many possible predecessors
+              for (auto &elem : iInfo->iPred[&I]) {
+                modified |= (dfa->in[&I] |= dfa->out[elem]);
               }
             }
             else { // Instruction in body of BB 
               if (pred != NULL) {
-                modified |= (dfa.in[&I] |= dfa.out[pred]);
+                modified |= (dfa->in[&I] |= dfa->out[pred]);
               }
             }
 
             // OUT = GEN union (IN - KILL)
-            modified |= (dfa.out[&I] |= ((dfa.in[&I] - dfa.kill[&I]) | dfa.gen[&I]));
+            modified |= (dfa->out[&I] |= ((dfa->in[&I] - dfa->kill[&I]) | dfa->gen[&I]));
 
             pred = &(*iIter);
           }
@@ -183,141 +357,117 @@ namespace {
       }
     }
 
-    void printDFA(InstrInfo &iInfo, DFAInfo &dfa) {
-      errs() << "START FUNCTION: " << iInfo.F->getName() << "\n";
-      for (unsigned i = 0; i < iInfo.instructions.size(); ++i) {
+    void printDFA() {
+      errs() << "START FUNCTION: " << iInfo->F->getName() << "\n";
+      for (unsigned i = 0; i < iInfo->instructions.size(); ++i) {
         errs() << "INSTRUCTION: ";
-        Instruction *I = iInfo.instructions[i];
+        Instruction *I = iInfo->instructions[i];
         I->print(errs());
         errs() << "\n";
-        //printSet(dfa.gen[I], "GEN", instructions);
-        //printSet(dfa.kill[I], "KILL", instructions);
-        printSet(dfa.in[I], "IN", iInfo.instructions);
-        printSet(dfa.out[I], "OUT", iInfo.instructions);
+        //printSet(dfa->gen[I], "GEN", instructions);
+        //printSet(dfa->kill[I], "KILL", instructions);
+        printSet(dfa->in[I], "IN", iInfo->instructions);
+        printSet(dfa->out[I], "OUT", iInfo->instructions);
         errs() << "\n\n\n";
       }
     }
 
-    Value* getPHINodeConstant(Instruction* reachingInst) {
-      Value* PHIconstant = NULL;
-
-      for (int op = 0; op < reachingInst->getNumOperands(); ++op) {
-        bool validOp = false;
-        Instruction* opI = (Instruction*)(reachingInst->getOperand(op));
-
-        if (auto* opCall = dyn_cast<CallInst>(opI)) {
-          if (opCall->getCalledFunction() == create_fn) {
-            Value* constant = opCall->getArgOperand(0);
-            if (auto* constantInt = dyn_cast<ConstantInt>(constant)) {
-              if (PHIconstant == NULL) {
-                validOp = true;
-                PHIconstant = constant;
-              } else if (constantInt->getSExtValue() == ((ConstantInt*)PHIconstant)->getSExtValue()) {
-                validOp = true;
-              }
-            }
-          }
-        }
-
-        if (!validOp) {
-          //errs() << "Conflicting PHINode constant values\n";
-          return NULL;
-        }
-      }
-
-      return PHIconstant;
-    }
-
     Value* getCATCreateConstant(CallInst* reachingCall) {
-      for (auto& U : reachingCall->uses()) {
-        Instruction* user = (Instruction*)(U.getUser());
-        if (auto* userCall = dyn_cast<CallInst>(user)) {
-          Function* CAT_fn = userCall->getCalledFunction();
-          if (CAT_fn != add_fn && CAT_fn != sub_fn && CAT_fn != get_fn) {
-            //errs() << "Escaping CAT_create call\n";
-            return NULL;
-          }
-        } else if (auto* store = dyn_cast<StoreInst>(user)) {
-          Value* valStored = store->getValueOperand();
-          if (auto* call = dyn_cast<CallInst>(valStored)) {
-            if (call->getCalledFunction() == create_fn) {
-              //errs() << "Escaping CAT_create in store\n";
-              return NULL;
-            }
-          }
-        }
-      }
-
       Value* constant = reachingCall->getArgOperand(0);
-      if (!isa<ConstantInt>(constant)) {
-        //errs() << "Non constant CAT_create\n";
+      if (!isa<ConstantInt>(constant))
         return NULL;
-      }
       return constant;
     }
 
-    void decideToPropogate(InstrInfo &iInfo, DFAInfo &dfa, map<CallInst*, Value*> &constantCAT) {
-      for (auto call : dfa.get_instrs) {
-        call->print(errs());
-        //errs() << "\n";
+    Value* getPHIConstants(Instruction* phi) {
+      ConstantInt* constant = NULL;
 
-        Instruction* CAT_read = (Instruction*)(call->getArgOperand(0));
+      for (int op = 0; op < phi->getNumOperands(); ++op) {
+        Instruction* opI = (Instruction*)(phi->getOperand(op));
 
-        //errs() << "IN SET:\n";
-        for (auto elem : dfa.in[call]) {
-          Instruction* reachingInst = iInfo.instructions[elem];
-
-          //iInfo.instructions[elem]->print(errs());
-          //errs() << "\n";
-          
-          Value* constant = NULL;
-          bool validConstant = false;
-
-          if (CAT_read == reachingInst) {
-            if (isa<PHINode>(reachingInst)) {
-              constant = getPHINodeConstant(reachingInst);
-            } else if (auto* reachingCall = dyn_cast<CallInst>(reachingInst)) {
-              Function *reachingFn = reachingCall->getCalledFunction();
-              if (reachingFn == create_fn) {
-                constant = getCATCreateConstant(reachingCall);
+        if (auto* opCall = dyn_cast<CallInst>(opI)) {
+          if (opCall->getCalledFunction() == create_fn) {
+            Value* constV = opCall->getArgOperand(0);
+            if (auto* constI = dyn_cast<ConstantInt>(constV)) {
+              if (constant == NULL) {
+                constant = constI;
+                continue;
+              } else if (constI->getSExtValue() == constant->getSExtValue()) {
+                continue;
               }
             }
-          } else {
-            continue;
-          }
-
-          if (constantCAT.find(call) != constantCAT.end() && constant != NULL) {
-            // Need to check for NULL constantCAT value
-            if (((ConstantInt*)constant)->getSExtValue() == ((ConstantInt*)(constantCAT[call]))->getSExtValue()) {
-              validConstant = true;
-            }
-          } else {
-            validConstant = (constant != NULL);
-          }
-
-          if (!validConstant) {
-            constantCAT[call] = NULL;
-            break;
-          } else {
-            //errs() << "Adding constant to propogate\n";
-            //constant->print(errs());
-            //errs() << "\n";
-            constantCAT[call] = constant;
           }
         }
-        //errs() << "END IN SET\n";
+
+        return NULL;
+      }
+
+      return (Value*)constant;
+    }
+
+    bool isInAlias(map<Instruction*, set<Instruction*>> &aliases,
+        Instruction* alias1, 
+        Instruction* alias2) {
+      if (aliases.find(alias1) == aliases.end()) 
+        return false;
+      auto* aliasSet = &(aliases[alias1]);
+      return (aliasSet->find(alias2) != aliasSet->end());
+    }
+
+    void decideToPropogate(map<CallInst*, Value*> &constantCAT) {
+      for (auto call : dfa->get_instrs) {
+        Instruction* getArg = (Instruction*)(call->getArgOperand(0));
+        Value* constant = NULL;
+        bool getArgReaches = false;
+        bool updateReaches = false;
+
+        if (auto* getCall = dyn_cast<CallInst>(getArg)) {
+          if (getCall->getCalledFunction() == create_fn) {
+            constant = getCATCreateConstant(getCall);
+          }
+        } else if (isa<PHINode>(getArg)) {
+          constant = getPHIConstants(getArg);
+        }
+
+        if (constant == NULL) 
+          continue;
+        if (dfa->escapedInstrs.test(iInfo->instrIndices[getArg]))
+          continue;
+
+        for (auto elem : dfa->in[call]) {
+          Instruction* reachingInst = iInfo->instructions[elem];
+
+          if (reachingInst == getArg)
+            getArgReaches = true;
+
+          if (auto* reachingCall = dyn_cast<CallInst>(reachingInst)) {
+            Function *callee = reachingCall->getCalledFunction();
+
+            if (isCATUpdate(callee)) {
+              Instruction* def = (Instruction*)(reachingCall->getArgOperand(0));
+              if (isInAlias(dfa->mayAliases, getArg, def)) {
+                updateReaches = true;
+                break;
+              }
+            }
+          }
+        }
+        
+        if (!getArgReaches || updateReaches) 
+          continue;
+
+        constantCAT[call] = constant;
       }
     }
 
-    bool doConstantPropogation(InstrInfo &iInfo, DFAInfo &dfa) {
+    bool doConstantPropogation() {
       bool changesMade = false;
       map<CallInst*, Value*> constantCAT;
 
-      decideToPropogate(iInfo, dfa, constantCAT);
+      decideToPropogate(constantCAT);
     
       for (auto iter = constantCAT.begin(); iter != constantCAT.end(); ++iter) {
         if (iter->second != NULL) {
-          //errs() << "REPLACING FOR THIS\n";
           CallInst* call = iter->first;
           BasicBlock::iterator ii(call);
           ReplaceInstWithValue(call->getParent()->getInstList(), ii, iter->second);
